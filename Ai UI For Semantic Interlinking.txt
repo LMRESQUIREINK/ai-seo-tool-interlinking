@@ -1,0 +1,149 @@
+	
+Ai UI For Semantic Interlinking
+
+🔑 ID:
+57637
+
+👨‍💻
+Python
+
+🕒
+19/07/2024
+Free
+Description:
+
+This code runs the semantic interlinking script with a user-friendly interface using Streamlit, making it easier to use the tool.
+
+If you want more details about it, check out this blog post.
+Code:
+import numpy as np
+import pandas as pd
+import streamlit as st
+from SimplerLLM.tools import text_chunker as chunker
+from SimplerLLM.language.llm import LLM, LLMProvider
+from sklearn.metrics.pairwise import cosine_similarity
+from SimplerLLM.tools.generic_loader import load_content
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from SimplerLLM.language.embeddings import EmbeddingsLLM, EmbeddingsProvider
+def get_embeddings(texts):
+    try:
+        embeddings_instance = EmbeddingsLLM.create(provider=EmbeddingsProvider.OPENAI, model_name="text-embedding-3-small")
+        batch_size = 10
+        embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            response = embeddings_instance.generate_embeddings(batch_texts)
+            embeddings.extend([item.embedding for item in response])
+        return np.array(embeddings)
+    except Exception as e:
+        print("An error occurred:", e)
+        return np.array([])
+def compare_with_threshold(input_chunks, target_title, threshold=0.5):
+    results = {}
+    title_embedding = get_embeddings([target_title])
+    chunk_embeddings = get_embeddings(input_chunks)
+    similarities = cosine_similarity(chunk_embeddings, title_embedding)
+    for idx, similarity in enumerate(similarities):
+        if similarity[0] >= threshold:
+            results[input_chunks[idx]] = similarity[0]
+    return results
+def choose_the_keyword(target_blog_title, similar_chunks):
+    llm_instance = LLM.create(provider=LLMProvider.OPENAI, model_name="gpt-4")
+    results = {}
+    for chunk, _ in similar_chunks:
+        prompt =  f"""
+        You are an expert in SEO and blog interlinking. I have a chunk of text from a blog post which is semantically
+        similar to the title of a target blog post, so I can use a keyword from the chunk to link to the blog post.
+        I'm gonna give you both the chunk and the title of the target blog delimited between triple backticks, and 
+        your task is to tell me which keyword in the chunk can be used to link to the target blog post. Make sure
+        to analyze both of them thoroughly to choose the right keyword from the chunk.
+        #Inputs:
+        chunk: ```{chunk}```
+        title of target blog post: ```{target_blog_title}```
+        #Output:
+        The keyword can be 2-3 words if necessary and it should be in the chunk. 
+        And, the response should be only the keyword and nothing else.
+        """ 
+        response = llm_instance.generate_response(prompt=prompt)
+        results[chunk] = response
+    return results
+def process_blog_pair(input_blog_url, target_blog_url):
+    try:
+        input_blog = load_content(input_blog_url.strip())
+        target_blog = load_content(target_blog_url.strip())
+    except Exception as e:
+        print(f"Failed to load content for URLs {input_blog_url} or {target_blog_url}: {e}")
+        return []
+    
+    input_blog_chunks = [chunk.text for chunk in chunker.chunk_by_sentences(input_blog.content).chunk_list]
+    target_blog_title = target_blog.title
+    similar_chunks = compare_with_threshold(input_blog_chunks, target_blog_title)
+    links_data = []
+    if similar_chunks:
+        keywords = choose_the_keyword(target_blog_title, similar_chunks.items())
+        for chunk, keyword in keywords.items():
+            link_info = {
+                "input_blog": input_blog_url,
+                "target_blog": target_blog_url,
+                "chunk": chunk,
+                "keyword": keyword,
+                "cosine_similarity": similar_chunks[chunk]
+            }
+            links_data.append(link_info)
+    return links_data
+def process_blogs(blog_urls, progress_bar, status_text):
+    links_data = []
+    with ThreadPoolExecutor() as executor:
+        future_to_url = {executor.submit(process_blog_pair, blog_url, target_url): (blog_url, target_url)
+                         for blog_url in blog_urls for target_url in blog_urls if blog_url != target_url}
+        total_tasks = len(future_to_url)
+        completed_tasks = 0
+        for future in as_completed(future_to_url):
+            completed_tasks += 1
+            progress = completed_tasks / total_tasks
+            progress_bar.progress(progress)
+            status_text.text(f'Processing... {int(progress * 100)}% complete')
+            links_data.extend(future.result())
+    df = pd.DataFrame(links_data)
+    df['input_blog'] = df['input_blog'].apply(make_clickable)
+    df['target_blog'] = df['target_blog'].apply(make_clickable)
+    return df.to_html(escape=False)
+def make_clickable(url):
+    return f'<a target="_blank" href="{url}">{url}</a>'
+def make_rows_scrollable():
+    st.markdown(
+        """
+        <style>
+        .dataframe div.row {
+            max-height: 100px;  /* Adjust based on your preference */
+            overflow-y: auto;
+        }
+        .dataframe td {
+            max-width: 300px;  /* Adjust based on your preference */
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .dataframe td:hover {
+            overflow: visible;
+            white-space: normal;
+            height:auto;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+st.title('Blog Interlinking Helper')
+    
+blog_urls_input = st.text_area("Enter each blog URL on a new line:")
+blog_urls = [url.strip() for url in blog_urls_input.split('\n') if url.strip()]
+if st.button('Process Blogs'):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text(f'Processing... {0}% complete')
+    make_rows_scrollable() 
+    if blog_urls:
+        result_html = process_blogs(blog_urls, progress_bar, status_text)
+        st.markdown(result_html, unsafe_allow_html=True)  
+        progress_bar.empty()
+        status_text.text('Processing complete!')
+    else:
+        st.error("Please enter at least one blog URL.")
